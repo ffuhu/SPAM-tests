@@ -34,7 +34,7 @@ pairs=(
 #export RANK=0
 #export LOCAL_RANK=0
 #export WORLD_SIZE=1
-#export OMP_NUM_THREADS=8
+export OMP_NUM_THREADS=8
 #export MASTER_ADDR="localhost"
 #export MASTER_PORT=12355
 #export CUDA_LAUNCH_BLOCKING=1
@@ -55,7 +55,7 @@ torchrun --standalone --nproc_per_node 2 torchrun_main.py \
     --lr 1e-3 \
     --density 1.0 \
     --update_gap 500 \
-    --batch_size 512  \
+    --batch_size 128  \
     --total_batch_size 512 \
     --num_training_steps 10000 \
     --warmup_steps 1000 \

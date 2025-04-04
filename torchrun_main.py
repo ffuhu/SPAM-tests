@@ -451,8 +451,9 @@ def main(args):
         if not layer_wise_flag:
 
             # log gradient spikes to wandb
-            gradient_spikes = training_utils.detect_grad_spikes(optimizer, threshold=50)
-            wandb.log({"gradient_spikes": gradient_spikes}, step=global_step)
+            if global_rank == 0:
+                gradient_spikes = training_utils.detect_grad_spikes(optimizer, threshold=50)
+                wandb.log({"gradient_spikes": gradient_spikes}, step=global_step)
 
             optimizer.step()
             scheduler.step()
