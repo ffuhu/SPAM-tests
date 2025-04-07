@@ -65,8 +65,7 @@ torchrun --standalone --nproc_per_node 2 torchrun_main.py \
     --threshold 5000 \
     --save_dir $save_dir \
     --optimizer Adam \
-    --warmup_epoch $prj \
-    --single_gpu
+    --warmup_epoch $prj
 done
 
 # for prj in 2000 

@@ -27,7 +27,7 @@ from peft_pretraining.modeling_llama import LlamaForCausalLM
 from peft_pretraining.modeling_pythia import GPTNeoXForCausalLM
 from datasets import load_from_disk,Dataset
 import bitsandbytes as bnb
-from galore_torch import SPAM
+from galore_torch import SPAM, AdamWGradients
 transformers.logging.set_verbosity_error()
 import psutil
 from datasets import config
@@ -352,6 +352,8 @@ def main(args):
     layer_wise_flag = False
     if args.optimizer.lower() == "adam":
         optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    elif args.optimizer.lower() == "adamwgradients":
+        optimizer = AdamWGradients(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     elif args.optimizer.lower() == "spam":
         # redefine way to call galore_adamw
         optimizer = SPAM(param_groups, lr=args.lr,weight_decay=args.weight_decay,warmup_steps=args.warmup_steps,DeltaT= args.DeltaT,threshold=args.threshold)

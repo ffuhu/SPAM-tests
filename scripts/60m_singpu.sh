@@ -64,7 +64,7 @@ torchrun --standalone --nproc_per_node 1 torchrun_main.py \
     --eval_every 1000 \
     --threshold 5000 \
     --save_dir $save_dir \
-    --optimizer Adam \
+    --optimizer AdamWGradients \
     --warmup_epoch $prj \
     --single_gpu
 done
