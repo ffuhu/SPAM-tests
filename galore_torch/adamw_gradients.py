@@ -173,6 +173,6 @@ class AdamWGradients(Optimizer):
             grad_dict = {str(key): torch.stack(value).float().numpy() for key, value in self.grad_dict.items()}
             # moment_dict = {str(key): torch.stack(value).float().numpy() for key, value in self.moment_dict.items()}
             # moment_second_dict = {str(key): torch.stack(value).float().numpy() for key, value in self.moment_second_dict.items()}
-            print("saving at", "./" + self.name + "_grad_dict1.npz")
-            np.savez_compressed("./" + self.name + "_grad_dict1.npz", **grad_dict)
+            np.savez_compressed("./grad_dict1.npz", **grad_dict)
+            print("saving at", "./grad_dict1.npz")
         return loss
