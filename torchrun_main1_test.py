@@ -27,9 +27,11 @@ from peft_pretraining.modeling_llama_test import LlamaForCausalLM
 
 from peft_pretraining.modeling_pythia import GPTNeoXForCausalLM
 import bitsandbytes as bnb
-from galore_torch import GaLoreAdafactor,AdamWtest #GaLoreAdamW0, GaLoreAdamW8bit
-wandb.login(key=open('wandb.key').readline())
+from galore_torch import GaLoreAdafactor, AdamWGradientSaving  # GaLoreAdamW0, GaLoreAdamW8bit
+
+# wandb.login(key=open('wandb.key').readline())
 transformers.logging.set_verbosity_error()
+
 
 def parse_args(args):
     parser = argparse.ArgumentParser()
@@ -37,7 +39,7 @@ def parse_args(args):
     parser.add_argument("--use_hf_model", default=False, action="store_true")
     parser.add_argument("--continue_from", type=str, default=None)
     parser.add_argument("--batch_size", type=int, required=True)
-    parser.add_argument("--model_type",type=str,default='llama') #pythia
+    parser.add_argument("--model_type", type=str, default='llama')  # pythia
     parser.add_argument("--gradient_accumulation", type=int, default=None)
     parser.add_argument("--total_batch_size", type=int, default=None)
     parser.add_argument("--max_length", type=int, default=256)
@@ -62,10 +64,10 @@ def parse_args(args):
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--name", type=str, default="test")
-    parser.add_argument("--grad_clipping", type=float, default=0.0)   
+    parser.add_argument("--grad_clipping", type=float, default=0.0)
     # beta1 for adafactor
     parser.add_argument("--beta1", type=float, default=0.0)
-    
+
     # GaLore parameters
     parser.add_argument("--rank", type=float, default=128)
     parser.add_argument("--update_proj_gap", type=int, default=50)
@@ -73,12 +75,12 @@ def parse_args(args):
     parser.add_argument("--galore_scale", type=float, default=1.0)
     parser.add_argument("--proj_type", type=str, default="std")
     parser.add_argument("--data_type", type=str, default="filter")
-    parser.add_argument("--trick", type=str, default="None1") # ln, scale
-    
+    parser.add_argument("--trick", type=str, default="None1")  # ln, scale
+
     parser.add_argument("--updating_mask_method", type=str, default="random")
     # disable ddp, single_gpu
     parser.add_argument("--single_gpu", default=False, action="store_true")
-    
+
     args = parser.parse_args(args)
 
     args = args_utils.check_args_torchrun_main(args)
@@ -88,7 +90,7 @@ def parse_args(args):
 @torch.no_grad()
 def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, device, batch_size):
     _time = time.time()
-    val_data = datasets.load_dataset("c4", "en", split="validation", streaming=True,trust_remote_code=True) #DGX
+    val_data = datasets.load_dataset("c4", "en", split="validation", streaming=True, trust_remote_code=True)  # DGX
     val_data = val_data.shuffle(seed=42)
     logger.info(f"Loaded validation dataset in {time.time() - _time:.2f} seconds")
 
@@ -135,7 +137,7 @@ def main(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
-    name=""
+    name = ""
     assert "LOCAL_RANK" in os.environ, "torchrun should set LOCAL_RANK"
     global_rank = int(os.environ['RANK'])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -160,11 +162,11 @@ def main(args):
 
     # turn off logger
     if global_rank != 0: logger.remove()
-            
+
     # initialize wandb without config (it is passed later)
     if global_rank == 0:
         wandb.init(project="galore-c4")
-        
+
     logger.info(f"Using dist with rank {global_rank} (only rank 0 will log)")
     logger.info("*" * 40)
     logger.info(f"Starting training with the arguments")
@@ -172,14 +174,17 @@ def main(args):
         logger.info(f"{k:30} {v}")
     logger.info("*" * 40)
 
-    #data = datasets.load_dataset("allenai/c4", "en", split="train", streaming=True)
-    if args.data_type=='filter':
-        
-        data=datasets.load_dataset("cerebras/SlimPajama-627B", split="train", streaming=True)
-    else:
+    # data = datasets.load_dataset("allenai/c4", "en", split="train", streaming=True)
+    if args.data_type == 'filter':
+
+        data = datasets.load_dataset("cerebras/SlimPajama-627B", split="train", streaming=True)
+    elif args.data_type == 'c4':
         data = datasets.load_dataset("allenai/c4", "en", split="train", streaming=True)
-    seed_for_shuffle = 42 
-    name=name+args.data_type+"_"+args.model_type+"_"+args.trick+args.model_config.split("/")[-1].split(".")[0]
+    else:
+        raise NotImplementedError(f"data_type={args.data_type} is not implemented")
+
+    seed_for_shuffle = 42
+    name = name + args.data_type + "_" + args.trick + "_" + args.model_config.split("/")[-1].split(".")[0]
 
     logger.info(f"Shuffling data with seed {seed_for_shuffle}")
     data: datasets.Dataset = data.shuffle(seed=seed_for_shuffle)
@@ -206,15 +211,15 @@ def main(args):
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=args.workers)
 
     model_config = AutoConfig.from_pretrained(args.model_config)
-    model_config.trick=args.trick
+    model_config.trick = args.trick
     if args.use_hf_model:
         model: HF_LlamaForCausalLM = AutoModelForCausalLM.from_config(model_config)
     else:
-        if args.model_type=='llama':
+        if args.model_type == 'llama':
             model = LlamaForCausalLM(model_config)
-        elif args.model_type=='pythia':
-            model=GPTNeoXForCausalLM(model_config)
-    
+        elif args.model_type == 'pythia':
+            model = GPTNeoXForCausalLM(model_config)
+
     if args.activation_checkpointing:
         model.gradient_checkpointing_enable()
 
@@ -224,7 +229,7 @@ def main(args):
     tokens_seen = 0
     tokens_seen_before = 0
     for p_name, p_tensor in model.named_parameters():
-        print(p_name,p_tensor.shape)
+        print(p_name, p_tensor.shape)
     if args.continue_from is not None:
         logger.info("*" * 40)
         logger.info(f"Loading model from {args.continue_from}")
@@ -233,7 +238,8 @@ def main(args):
         logger.info(f"Model successfully loaded (strict=True policy)")
 
         if os.path.exists(os.path.join(args.continue_from, "training_state.json")):
-            logger.info(f"Loading training state like global_step, update_step, and tokens_seen from {args.continue_from}")
+            logger.info(
+                f"Loading training state like global_step, update_step, and tokens_seen from {args.continue_from}")
             with open(os.path.join(args.continue_from, "training_state.json")) as f:
                 _old_state = json.load(f)
             global_step = _old_state["global_step"]
@@ -249,14 +255,14 @@ def main(args):
             logger.warning(f"Did not find training state in {args.continue_from}, global step will start from zero")
         logger.info("*" * 40)
 
-
     if args.dtype in ["bf16", "bfloat16"]:
         model = model.to(device=device, dtype=torch.bfloat16)
     else:
         model = model.to(device=device)
 
     n_total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    # trainable_params = [p for p in model.parameters() if p.requires_grad]
+    trainable_params = [{"params": p, "name": name} for name, p in model.named_parameters() if p.requires_grad]
     # Initialize wandb
     run_config = dict(vars(args))
     run_config.update({
@@ -270,31 +276,32 @@ def main(args):
 
     if global_rank == 0:
         wandb.config.update(run_config, allow_val_change=True)
-        wandb.save(os.path.abspath(__file__), policy="now") # save current script
+        wandb.save(os.path.abspath(__file__), policy="now")  # save current script
         # fix tqdm visual length to 80 so that the progress bar
         # doesn't jump around when changing from external display to laptop
         pbar = tqdm(total=args.num_training_steps - update_step, desc="Update steps", ncols=80)
-    
+
     if 'galore' in args.optimizer.lower():
         # make parameters with "rank" to a single group, if param_name has "mlp" or "attn"
         galore_params = []
-        target_modules_list = ["attn", "mlp","attention"]
+        target_modules_list = ["attn", "mlp", "attention"]
         for module_name, module in model.named_modules():
             if not isinstance(module, nn.Linear):
                 continue
 
             if not any(target_key in module_name for target_key in target_modules_list):
                 continue
-            
+
             print('enable GaLore for weights in module: ', module_name)
             galore_params.append(module.weight)
         id_galore_params = [id(p) for p in galore_params]
         # make parameters without "rank" to another group
         regular_params = [p for p in model.parameters() if id(p) not in id_galore_params]
         # then call galore_adamw
-        param_groups = [{'params': regular_params}, 
-                        {'params': galore_params, 'rank': args.rank, 'update_proj_gap': args.update_proj_gap, 'scale': args.galore_scale, 'proj_type': args.proj_type}]
-        
+        param_groups = [{'params': regular_params},
+                        {'params': galore_params, 'rank': args.rank, 'update_proj_gap': args.update_proj_gap,
+                         'scale': args.galore_scale, 'proj_type': args.proj_type}]
+
     # print params and trainable params
     logger.info(f"\n{model}\n")
     logger.info(f"Total params: {sum(p.numel() for p in model.parameters()) / 1_000_000:.2f}M")
@@ -302,13 +309,13 @@ def main(args):
     if 'galore' in args.optimizer.lower():
         logger.info(f"Total params with GaLore enabled: {sum(p.numel() for p in galore_params) / 1_000_000:.2f}M")
     logger.info(f"Saving model to {args.save_dir} every {args.save_every} update steps")
-    
+
     layer_wise_flag = False
     if args.optimizer.lower() == "adam":
         optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
-    elif args.optimizer.lower() == "adamwtest":
+    elif args.optimizer.lower() == "adamwgradientsaving":
         # redefine way to call galore_adamw
-        optimizer = AdamWtest(trainable_params, lr=args.lr, weight_decay=args.weight_decay,gap=args.gap,name=name)
+        optimizer = AdamWGradientSaving(trainable_params, lr=args.lr, weight_decay=args.weight_decay, gap=args.gap, name=name)
     # implement sgd
     elif args.optimizer.lower() == "sgd":
         optimizer = torch.optim.SGD(trainable_params, lr=args.lr, weight_decay=args.weight_decay, momentum=args.beta1)
@@ -353,7 +360,10 @@ def main(args):
         for p in model.parameters():
             if p.requires_grad:
                 if id(p) in id_galore_params:
-                    optimizer_dict[p] = GaLoreAdamW8bit([{'params': [p], 'rank': args.rank, 'update_proj_gap': args.update_proj_gap * 2, 'scale': args.galore_scale, 'proj_type': args.proj_type}], lr=args.lr, weight_decay=args.weight_decay)
+                    optimizer_dict[p] = GaLoreAdamW8bit([{'params': [p], 'rank': args.rank,
+                                                          'update_proj_gap': args.update_proj_gap * 2,
+                                                          'scale': args.galore_scale, 'proj_type': args.proj_type}],
+                                                        lr=args.lr, weight_decay=args.weight_decay)
                 else:
                     optimizer_dict[p] = bnb.optim.Adam8bit([p], lr=args.lr, weight_decay=args.weight_decay)
 
@@ -370,7 +380,7 @@ def main(args):
                 )
 
         def optimizer_hook(p):
-            if p.grad is None: 
+            if p.grad is None:
                 return
             optimizer_dict[p].step()
             optimizer_dict[p].zero_grad()
@@ -380,9 +390,9 @@ def main(args):
         for p in model.parameters():
             if p.requires_grad:
                 p.register_post_accumulate_grad_hook(optimizer_hook)
-                
+
         layer_wise_flag = True
-        
+
     else:
         raise ValueError(f"Optimizer {args.optimizer} not supported")
 
@@ -412,8 +422,8 @@ def main(args):
     # TRAINING LOOP
     # we'll never go through all the data, so no need for epochs
     # ##############################
-    temp_loss=0
-    losses=[]
+    temp_loss = 0
+    losses = []
     for batch_idx, batch in enumerate(dataloader):
 
         global_step += 1
@@ -428,29 +438,30 @@ def main(args):
         labels = batch["input_ids"].clone()
         labels[labels == pad_idx] = -100
         tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
-        
+
         loss = model(**batch, labels=labels).loss
         scaled_loss = loss / args.gradient_accumulation
         scaled_loss.backward()
-        temp_loss+=loss.item()/args.gradient_accumulation
+        temp_loss += loss.item() / args.gradient_accumulation
         if global_step % args.gradient_accumulation != 0:
             continue
-        losses.append(temp_loss/args.gradient_accumulation)
+        losses.append(temp_loss / args.gradient_accumulation)
         # print("Training loss at:",global_step,temp_loss/args.gradient_accumulation)
-        pbar.set_description(f"Training loss at {global_step}:\t{temp_loss/args.gradient_accumulation:.4f} (Update step: {update_step})")
-        temp_loss=0  # set to 0 before next iter
-        if update_step%40==0:
-            if global_rank==0:
-                np.save(name+"_loss",np.array(losses))
-        if update_step>1500:
+        pbar.set_description(
+            f"Training loss at {global_step}:\t{temp_loss / args.gradient_accumulation:.4f} (Update step: {update_step})")
+        temp_loss = 0  # set to 0 before next iter
+        if update_step % 40 == 0:
+            if global_rank == 0:
+                np.save(name + "_loss", np.array(losses))
+        if update_step > 1500:
             return 0
         # The below code is only executed during the update step
-        
+
         # add grad clipping
         if args.grad_clipping != 0.0: torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
 
         if global_rank == 0: pbar.update(1)
-        
+
         if not layer_wise_flag:
             optimizer.step()
             scheduler.step()
@@ -486,7 +497,7 @@ def main(args):
             }
             with open(f"{current_model_directory}/training_state.json", "w") as f:
                 json.dump(training_state_checkpoint, f, indent=4)
-                
+
             # save wandb related info
             wandb_info = {
                 "wandb_id": wandb.run.id,
@@ -504,7 +515,7 @@ def main(args):
                 wandb.log({
                     "final_eval_loss": total_loss,
                     "final_eval_tokens": evaluated_on_tokens,
-                    },
+                },
                     step=global_step,
                 )
             logger.info(f"Eval loss at step {update_step}: {total_loss}")
@@ -526,7 +537,7 @@ def main(args):
                 "throughput_tokens": tokens_in_update / update_time,
                 "throughput_examples": args.total_batch_size / update_time,
                 "throughput_batches": batches_in_update / update_time,
-                },
+            },
                 step=global_step,
             )
         update_time = time.time()
@@ -568,7 +579,8 @@ def main(args):
     logger.info("Running final evaluation")
     model.eval()
     del loss, optimizer, scheduler
-    import gc; gc.collect()
+    import gc;
+    gc.collect()
     torch.cuda.empty_cache()
 
     total_loss, evaluated_on_tokens = evaluate_model(
@@ -579,14 +591,14 @@ def main(args):
         wandb.log({
             "final_eval_loss": total_loss,
             "final_eval_tokens": evaluated_on_tokens,
-            },
+        },
             step=global_step,
         )
         logger.info(f"Final eval loss: {total_loss}")
 
     logger.info("Script finished successfully")
     print(f"Rank {global_rank} finished successfully")
-    
+
 
 if __name__ == "__main__":
     print("Starting script")

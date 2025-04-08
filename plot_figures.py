@@ -3,9 +3,10 @@ from matplotlib.pyplot import figure, show
 import matplotlib.pyplot as plt
 
 # grad_data = np.load("./c4_llama_grad_dict.npz")
-grad_data = np.load("./grad_dict1.npz")
+grad_data = np.load("./c4_llama_nonellama_60mgrad_dict1.npz")
 grad_dict = {key: grad_data[key] for key in grad_data}
 # llama_loss = np.load("c4_llama_loss.npy")[:1000]
+llama_loss = np.load("./c4_llama_nonellama_60m_loss.npy")[:1000]
 
 num_spikes = []  # Used to hold the number of elements greater than 50 in each layer
 for key in grad_data.keys():
@@ -42,8 +43,24 @@ b_detach = true_indices_detach[2][0]
 # vgg_all = fig.add_subplot(1, 1, 1)
 # vgg_all.plot(grad_detach[:, true_indices_detach[1][:], true_indices_detach[2][:]])
 
-fig = plt.figure(num=None, figsize=(22, 5), dpi=120, facecolor='w', edgecolor='k')
-plt.plot(grad_detach[:, true_indices_detach[1][:], true_indices_detach[2][:]])
+# fig = plt.figure(num=None, figsize=(22, 5), dpi=120, facecolor='w', edgecolor='k')
+# plt.plot(grad_detach[:, true_indices_detach[1][:], true_indices_detach[2][:]])
+# plt.show()
+
+fig = plt.figure(num=None, figsize=(10, 10), dpi=120, facecolor='w', edgecolor='k')
+subfig = fig.add_subplot(2, 1, 1)
+subfig.plot(llama_loss)
+subfig.grid(True)
+subfig.set_xlim(0, 1000)  # Establecer límites en el eje x
+subfig.set_xticks(range(0, 1001, 100))  # X-axis grid every 100 units
+
+
+subfig = fig.add_subplot(2, 1, 2)
+subfig.plot(grad_detach[:, true_indices_detach[1][0], true_indices_detach[2][0]])
+subfig.grid(True)
+subfig.set_xlim(0, 1000)  # Establecer límites en el eje x
+# Increase grid size by setting custom ticks
+subfig.set_xticks(range(0, 1001, 100))  # X-axis grid every 100 units
 plt.show()
 
 for i in range(0, true_indices_detach[1].shape[0], 20):
