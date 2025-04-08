@@ -184,7 +184,7 @@ def main(args):
         raise NotImplementedError(f"data_type={args.data_type} is not implemented")
 
     seed_for_shuffle = 42
-    name = name + args.data_type + "_" + args.trick + "_" + args.model_config.split("/")[-1].split(".")[0]
+    name = name + args.data_type + "_" + "_" + args.model_config.split("/")[-1].split(".")[0] + args.trick
 
     logger.info(f"Shuffling data with seed {seed_for_shuffle}")
     data: datasets.Dataset = data.shuffle(seed=seed_for_shuffle)
