@@ -94,7 +94,7 @@ class AdamWGradientSaving(Optimizer):
         n = 0
 
         for group in self.param_groups:
-            for p_name, p in group["name"], group["params"]:
+            for p in group["params"]:
                 if p.grad is None:
                     continue
                 grad = p.grad
@@ -142,8 +142,9 @@ class AdamWGradientSaving(Optimizer):
                 # END - TIANJING CODE
 
                 # for gradient spike detection
+                p_name = group["name"]
                 if p_name not in self.grad_dict.keys():
-                    print(f"Save gradients for layer {p_name}")
+                    print(f"Save gradients for layer:\t{p_name}")
                     self.grad_dict[p_name] = []
                 self.grad_dict[p_name].append(grad.detach().cpu().to(dtype=torch.float16))
 

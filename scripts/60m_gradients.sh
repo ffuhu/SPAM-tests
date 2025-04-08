@@ -39,7 +39,7 @@ for pair in "${pairs[@]}"; do
         --weight_decay 0 \
         --dtype bfloat16 \
         --eval_every 1000 \
-        --optimizer adamw \
+        --optimizer adamwgradientsaving \
         --proj_type std \
         --updating_mask_method random \
         --model_type llama \
