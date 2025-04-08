@@ -14,7 +14,7 @@ from .galore_projector_tensor import GaLoreProjectorTensor
 import torch.optim as optim
 
 
-class AdamWGradients(Optimizer):
+class AdamWtest(Optimizer):
     """
     Implements Adam algorithm with weight decay fix as introduced in [Decoupled Weight Decay
     Regularization](https://arxiv.org/abs/1711.05101).
@@ -127,17 +127,17 @@ class AdamWGradients(Optimizer):
                 denom = exp_avg_sq.sqrt().add_(group["eps"])
 
                 # for gradient spike detection
-                if 'rank' in group:
-                    if n == 20:
-                        if n not in self.grad_dict.keys():
-                            print("save n", n)
-                            self.grad_dict[n] = []
-                            self.moment_dict[n] = []
-                            self.moment_second_dict[n] = []
-                        self.grad_dict[n].append(grad.detach().cpu())
-                    # self.moment_dict[n].append(exp_avg.detach().cpu())
-                    # self.moment_second_dict[n].append(exp_avg_sq.detach().cpu())
-                    n += 1
+                # if 'rank' in group:
+                if n == 20:
+                    if n not in self.grad_dict.keys():
+                        print("save n", n)
+                        self.grad_dict[n] = []
+                        self.moment_dict[n] = []
+                        self.moment_second_dict[n] = []
+                    self.grad_dict[n].append(grad.detach().cpu())
+                # self.moment_dict[n].append(exp_avg.detach().cpu())
+                # self.moment_second_dict[n].append(exp_avg_sq.detach().cpu())
+                n += 1
 
                 step_size = group["lr"]
                 if group["correct_bias"]:  # No bias correction for Bert
@@ -169,10 +169,11 @@ class AdamWGradients(Optimizer):
 
         # for gradient spike detection
         if state['step'] % 1000 == 0 and state['step'] < 1005:
+        # if state['step'] % 10 == 0 and state['step'] < 11:
             # np.save("./grad_id.npy",self.trajectories_id)
             grad_dict = {str(key): torch.stack(value).float().numpy() for key, value in self.grad_dict.items()}
             # moment_dict = {str(key): torch.stack(value).float().numpy() for key, value in self.moment_dict.items()}
             # moment_second_dict = {str(key): torch.stack(value).float().numpy() for key, value in self.moment_second_dict.items()}
-            np.savez_compressed("./grad_dict1.npz", **grad_dict)
-            print("saving at", "./grad_dict1.npz")
+            np.savez_compressed("./" + self.name + "grad_dict1.npz", **grad_dict)
+            print("saving at", "./" + self.name + "grad_dict1.npz")
         return loss
