@@ -28,11 +28,11 @@ from peft_pretraining.modeling_llama_test import LlamaForCausalLM
 
 from peft_pretraining.modeling_pythia import GPTNeoXForCausalLM
 import bitsandbytes as bnb
-from galore_torch import GaLoreAdafactor, AdamWGradientSaving, AdamWGradientInjection, Muon, MuonGradientSaving #AdamGradientSaving   # GaLoreAdamW0, GaLoreAdamW8bit
+from galore_torch import GaLoreAdafactor, AdamWGradientSaving, AdamWGradientInjection  # GaLoreAdamW0, GaLoreAdamW8bit
+
 # wandb.login(key=open('wandb.key').readline())
 transformers.logging.set_verbosity_error()
 
-STEPS_STOP = 151
 
 def parse_args(args):
     parser = argparse.ArgumentParser()
@@ -63,7 +63,6 @@ def parse_args(args):
                         help="Number of tokens to train on. Overwrites num_training_steps. "
                              "You can use M and B suffixes, e.g. 100M or 1B.")
     parser.add_argument("--save_every", type=int, default=10_000)
-    parser.add_argument("--save_gradients_every", type=int, default=50)
     parser.add_argument("--save_dir", type=str, default=None)
     parser.add_argument("--tags", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="bfloat16" if torch.cuda.is_bf16_supported() else "float32")
@@ -352,19 +351,13 @@ def main(args):
                                            grad_injection_duration=args.grad_injection_duration,
                                            total_steps=args.num_training_steps)
     # implement muon
-    elif args.optimizer.lower() == "muongradientsaving":
+    elif args.optimizer.lower() == "muon":
         # collect the parameters to optimize
         hidden_matrix_params = [p for n, p in model.named_parameters()
                                 if p.ndim >= 2 and "embed" not in n and "lm_head" not in n]
         embed_params = [p for n, p in model.named_parameters() if "embed" in n]
         scalar_params = [p for n, p in model.named_parameters() if p.ndim < 2]
         head_params = [model.lm_head.weight]
-
-        hidden_matrix_names = [n for n, p in model.named_parameters()
-                                if p.ndim >= 2 and "embed" not in n and "lm_head" not in n]
-        embed_names = [n for n, p in model.named_parameters() if "embed" in n]
-        scalar_names = [n for n, p in model.named_parameters() if p.ndim < 2]
-        head_names = ["model.lm_head.weight"]
 
         # log parameters being optimized by Muon
         muon_params_table = wandb.Table(columns=["param_name", "param_shape"])
@@ -374,21 +367,13 @@ def main(args):
         wandb.log({"muon_params": muon_params_table})
 
         # init the optimizer(s)
-        adam_params = [dict(names=head_names, params=head_params, lr=args.lr_adam_head),
-                       dict(names=embed_names, params=embed_params, lr=args.lr_adam_embed),
-                       dict(names=scalar_names, params=scalar_params, lr=args.lr_adam_scalar)]
-        muon_params = dict(names=hidden_matrix_names, params=hidden_matrix_params)
+        adam_params = [dict(params=head_params, lr=args.lr_adam_head), dict(params=embed_params, lr=args.lr_adam_embed),
+                       dict(params=scalar_params, lr=args.lr_adam_scalar)]
         # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
         # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-        # optimizer1 = torch.optim.Adam(adam_params, weight_decay=args.weight_decay,
-        #                               betas=(0.8, 0.95), eps=1e-10, fused=True)
-        optimizer1 = AdamWGradientSaving(adam_params, weight_decay=args.weight_decay, betas=(0.8, 0.95), eps=1e-10,
-                                         gap=args.gap, name=name,
-                                         log_folder=log_folder, save_every_N_steps=args.save_gradients_every)
-        optimizer2 = MuonGradientSaving(muon_params, lr=args.lr_muon, momentum=0.95,
-                                        rank=local_rank, world_size=world_size,
-                                        name=name,
-                                        log_folder=log_folder, save_every_N_steps=args.save_gradients_every)
+        optimizer1 = torch.optim.Adam(adam_params, weight_decay=args.weight_decay,
+                                      betas=(0.8, 0.95), eps=1e-10, fused=True)
+        optimizer2 = Muon(hidden_matrix_params, lr=args.lr_muon, momentum=0.95, rank=local_rank, world_size=world_size)
         # optimizer2 = Muon(hidden_matrix_params, lr=args.lr_muon, momentum=0, nesterov=False, rank=local_rank, world_size=world_size)
         # logger.info("Working with STATELESS Muon")
         optimizers = [optimizer1, optimizer2]
@@ -428,70 +413,58 @@ def main(args):
     # 8-bit Adam
     elif args.optimizer.lower() == "adam8bit":
         optimizer = bnb.optim.Adam8bit(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
-    # elif args.optimizer.lower() == "galore_adamw8bit":
-    #     optimizer = GaLoreAdamW8bit(param_groups, lr=args.lr, weight_decay=args.weight_decay)
-    # elif args.optimizer.lower() == 'galore_adamw8bit_per_layer':
-    #     # TODO: seems scheduler call twice in one update step, need to check, for now double the num_training_steps, warmup_steps and update_proj_gap
-    #     optimizer_dict = {}
-    #     for p in model.parameters():
-    #         if p.requires_grad:
-    #             if id(p) in id_galore_params:
-    #                 optimizer_dict[p] = GaLoreAdamW8bit([{'params': [p], 'rank': args.rank,
-    #                                                       'update_proj_gap': args.update_proj_gap * 2,
-    #                                                       'scale': args.galore_scale, 'proj_type': args.proj_type}],
-    #                                                     lr=args.lr, weight_decay=args.weight_decay)
-    #             else:
-    #                 optimizer_dict[p] = bnb.optim.Adam8bit([p], lr=args.lr, weight_decay=args.weight_decay)
-    #
-    #     # get scheduler dict
-    #     scheduler_dict = {}
-    #     for p in model.parameters():
-    #         if p.requires_grad:
-    #             scheduler_dict[p] = training_utils.get_scheculer(
-    #                 optimizer=optimizer_dict[p],
-    #                 scheduler_type=args.scheduler,
-    #                 num_training_steps=args.num_training_steps * 2,
-    #                 warmup_steps=args.warmup_steps * 2,
-    #                 min_lr_ratio=args.min_lr_ratio,
-    #             )
-    #
-    #     def optimizer_hook(p):
-    #         if p.grad is None:
-    #             return
-    #         optimizer_dict[p].step()
-    #         optimizer_dict[p].zero_grad()
-    #         scheduler_dict[p].step()
-    #
-    #     # Register the hook onto every parameter
-    #     for p in model.parameters():
-    #         if p.requires_grad:
-    #             p.register_post_accumulate_grad_hook(optimizer_hook)
-    #
-    #     layer_wise_flag = True
+    elif args.optimizer.lower() == "galore_adamw8bit":
+        optimizer = GaLoreAdamW8bit(param_groups, lr=args.lr, weight_decay=args.weight_decay)
+    elif args.optimizer.lower() == 'galore_adamw8bit_per_layer':
+        # TODO: seems scheduler call twice in one update step, need to check, for now double the num_training_steps, warmup_steps and update_proj_gap
+        optimizer_dict = {}
+        for p in model.parameters():
+            if p.requires_grad:
+                if id(p) in id_galore_params:
+                    optimizer_dict[p] = GaLoreAdamW8bit([{'params': [p], 'rank': args.rank,
+                                                          'update_proj_gap': args.update_proj_gap * 2,
+                                                          'scale': args.galore_scale, 'proj_type': args.proj_type}],
+                                                        lr=args.lr, weight_decay=args.weight_decay)
+                else:
+                    optimizer_dict[p] = bnb.optim.Adam8bit([p], lr=args.lr, weight_decay=args.weight_decay)
+
+        # get scheduler dict
+        scheduler_dict = {}
+        for p in model.parameters():
+            if p.requires_grad:
+                scheduler_dict[p] = training_utils.get_scheculer(
+                    optimizer=optimizer_dict[p],
+                    scheduler_type=args.scheduler,
+                    num_training_steps=args.num_training_steps * 2,
+                    warmup_steps=args.warmup_steps * 2,
+                    min_lr_ratio=args.min_lr_ratio,
+                )
+
+        def optimizer_hook(p):
+            if p.grad is None:
+                return
+            optimizer_dict[p].step()
+            optimizer_dict[p].zero_grad()
+            scheduler_dict[p].step()
+
+        # Register the hook onto every parameter
+        for p in model.parameters():
+            if p.requires_grad:
+                p.register_post_accumulate_grad_hook(optimizer_hook)
+
+        layer_wise_flag = True
 
     else:
         raise ValueError(f"Optimizer {args.optimizer} not supported")
 
     if not layer_wise_flag:
-        if "muon" in args.optimizer.lower():
-            schedulers = []
-            for opt in optimizers:
-                schedulers.append(
-                    training_utils.get_scheculer(
-                        optimizer=opt,
-                        scheduler_type=args.scheduler,
-                        num_training_steps=args.num_training_steps,
-                        warmup_steps=args.warmup_steps,
-                        min_lr_ratio=args.min_lr_ratio,
-                    ))
-        else:
-            scheduler = training_utils.get_scheculer(
-                optimizer=optimizer,
-                scheduler_type=args.scheduler,
-                num_training_steps=args.num_training_steps,
-                warmup_steps=args.warmup_steps,
-                min_lr_ratio=args.min_lr_ratio,
-            )
+        scheduler = training_utils.get_scheculer(
+            optimizer=optimizer,
+            scheduler_type=args.scheduler,
+            num_training_steps=args.num_training_steps,
+            warmup_steps=args.warmup_steps,
+            min_lr_ratio=args.min_lr_ratio,
+        )
 
     if not args.single_gpu:
         model: LlamaForCausalLM = torch.nn.parallel.DistributedDataParallel(
@@ -522,6 +495,10 @@ def main(args):
             print(f"Rank {global_rank} stopping training.")
             break
 
+        if update_step > 750:
+            print("Reached 750 steps, stopping training...")
+            break
+
         batch = {k: v.to(device) for k, v in batch.items()}
         labels = batch["input_ids"].clone()
         labels[labels == pad_idx] = -100
@@ -538,14 +515,11 @@ def main(args):
         pbar.set_description(
             f"Training loss at {global_step}:\t{temp_loss / args.gradient_accumulation:.4f}")
         temp_loss = 0  # set to 0 before next iter
-        if update_step % args.save_gradients_every == 0:
+        if update_step % 100 == 0:
             if global_rank == 0:
                 np.save(os.path.join(log_folder, name + "_loss"), np.array(losses))
                 print(f"Saving loss to: {log_folder}")
-        # if update_step > 750:
-
-        if update_step > STEPS_STOP:
-            print(f"Reached {STEPS_STOP} steps, stopping training...")
+        if update_step > 1500:
             return 0
         # The below code is only executed during the update step
 
@@ -555,15 +529,9 @@ def main(args):
         if global_rank == 0: pbar.update(1)
 
         if not layer_wise_flag:
-            if "muon" in args.optimizer.lower():
-                for opt, sch in zip(optimizers, schedulers):
-                    opt.step()
-                    sch.step()
-                    opt.zero_grad()
-            else:
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
 
         update_step += 1
         update_time = time.time() - update_time
@@ -571,35 +539,19 @@ def main(args):
         # save checkpoint by save_every
         if local_step > args.gradient_accumulation and update_step % args.save_every == 0 and global_rank == 0:
             current_model_directory = f"{args.save_dir}/model_{update_step}"
-            # logger.info(f"Saving model and optimizer to {current_model_directory}, update step {update_step}")
+            logger.info(f"Saving model and optimizer to {current_model_directory}, update step {update_step}")
             os.makedirs(args.save_dir, exist_ok=True)
-            if hasattr(model, 'module'):
-                model.module.save_pretrained(current_model_directory, max_shard_size='100GB')
-            else:
-                model.save_pretrained(current_model_directory, max_shard_size='100GB')
+            model.module.save_pretrained(current_model_directory, max_shard_size='100GB')
 
-            if "muon" in args.optimizer.lower():
-                optimizer_checkpoint = {
-                    opt.__class__: {
-                        "optimizer": opt.state_dict(),
-                        "scheduler": sch.state_dict(),
-                        "update_step": update_step,
-                        "global_step": global_step,
-                        "config": run_config,
-                        "wandb": wandb.run.dir,
-                        "dtype": args.dtype,
-                    } for opt, sch in zip(optimizers, schedulers)
-                }
-            else:
-                optimizer_checkpoint = {
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                    "update_step": update_step,
-                    "global_step": global_step,
-                    "config": run_config,
-                    "wandb": wandb.run.dir,
-                    "dtype": args.dtype,
-                }
+            optimizer_checkpoint = {
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "update_step": update_step,
+                "global_step": global_step,
+                "config": run_config,
+                "wandb": wandb.run.dir,
+                "dtype": args.dtype,
+            }
             torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
 
             training_state_checkpoint = {
@@ -634,34 +586,26 @@ def main(args):
                 )
             logger.info(f"Eval loss at step {update_step}: {total_loss}")
 
+        if not layer_wise_flag:
+            lr = optimizer.param_groups[0]["lr"]
+        else:
+            lr = list(optimizer_dict.values())[0].param_groups[0]["lr"]
         tokens_in_update = tokens_seen - tokens_seen_before
         tokens_seen_before = tokens_seen
         batches_in_update = args.gradient_accumulation * world_size
-        wandb_log = {
-            "loss": loss.item(),
-            "update_step": update_step,
-            "tokens_seen": tokens_seen,
-            "throughput_tokens": tokens_in_update / update_time,
-            "throughput_examples": args.total_batch_size / update_time,
-            "throughput_batches": batches_in_update / update_time,
-        }
 
-        if not layer_wise_flag:
-            if "muon" in args.optimizer.lower():
-                for opt in optimizers:
-                    for ipg, param_groups in enumerate(opt.param_groups):
-                        opt_name = opt.__class__.__name__
-                        wandb_log[f"lr_{opt_name}_params{ipg}"] = param_groups["lr"]
-            else:
-                wandb_log['lr'] = optimizer.param_groups[0]["lr"]
-        else:
-            # TODO: fix this to work with MUON
-            assert "muon" not in args.optimizer, "resume training not implemented for muon opt"
-            lr = list(optimizer_dict.values())[0].param_groups[0]["lr"]
         if global_rank == 0:
-            wandb.log(wandb_log,
-                      step=global_step,
-                      )
+            wandb.log({
+                "loss": loss.item(),
+                "lr": lr,
+                "update_step": update_step,
+                "tokens_seen": tokens_seen,
+                "throughput_tokens": tokens_in_update / update_time,
+                "throughput_examples": args.total_batch_size / update_time,
+                "throughput_batches": batches_in_update / update_time,
+            },
+                step=global_step,
+            )
         update_time = time.time()
 
     # ##############################
@@ -674,38 +618,17 @@ def main(args):
     if global_rank == 0 and not os.path.exists(current_model_directory):
         logger.info(f"Saving model and optimizer to {current_model_directory}, update step {update_step}")
         os.makedirs(args.save_dir, exist_ok=True)
+        model.module.save_pretrained(current_model_directory)
 
-        if hasattr(model, 'module'):
-            model.module.generation_config.do_sample = True
-            model.module.save_pretrained(current_model_directory)
-        else:
-            model.generation_config.do_sample = True
-            model.save_pretrained(current_model_directory)
-            # model.config.pad_token_id = model.config.eos_token_id
-            # model.generation_config.pad_token_id = model.config.eos_token_id
-
-        if "muon" in args.optimizer.lower():
-            optimizer_checkpoint = {
-                opt.__class__.__name__: {
-                    "optimizer": opt.state_dict(),
-                    "scheduler": sch.state_dict(),
-                    "update_step": update_step,
-                    "global_step": global_step,
-                    "config": run_config,
-                    "wandb": wandb.run.dir,
-                    "dtype": args.dtype,
-                } for opt, sch in zip(optimizers, schedulers)
-            }
-        else:
-            optimizer_checkpoint = {
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "update_step": update_step,
-                "global_step": global_step,
-                "config": run_config,
-                "wandb": wandb.run.dir,
-                "dtype": args.dtype,
-            }
+        optimizer_checkpoint = {
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "update_step": update_step,
+            "global_step": global_step,
+            "config": run_config,
+            "wandb": wandb.run.dir,
+            "dtype": args.dtype,
+        }
         torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
 
         training_state_checkpoint = {
@@ -721,15 +644,12 @@ def main(args):
     # Final evaluation
     logger.info("Running final evaluation")
     model.eval()
-    if "muon" in args.optimizer.lower():
-        del loss, optimizers, schedulers
-    else:
-        del loss, optimizer, scheduler
+    del loss, optimizer, scheduler
     import gc;
     gc.collect()
     torch.cuda.empty_cache()
 
-    total_loss, evaluated_on_tokens, perplexity = evaluate_model(
+    total_loss, evaluated_on_tokens = evaluate_model(
         model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
     )
 
@@ -737,7 +657,6 @@ def main(args):
         wandb.log({
             "final_eval_loss": total_loss,
             "final_eval_tokens": evaluated_on_tokens,
-            "perplexity": perplexity,
         },
             step=global_step,
         )
@@ -745,12 +664,6 @@ def main(args):
 
     logger.info("Script finished successfully")
     print(f"Rank {global_rank} finished successfully")
-    print("perplexity", perplexity)
-
-    # Ensure cleanup happens even if an exception occurs
-    if dist.is_initialized():
-        dist.destroy_process_group()
-        print("dist properly finished")
 
 
 if __name__ == "__main__":

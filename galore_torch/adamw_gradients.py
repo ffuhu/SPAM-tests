@@ -1,4 +1,5 @@
 # copy dependencies from transformers/optimization.py
+import os
 import math
 import warnings
 from typing import Callable, Iterable, Tuple
@@ -9,10 +10,13 @@ from torch.optim import Optimizer
 import numpy as np
 from transformers.utils.versions import require_version
 
+import sys
+import h5py
+
 from .galore_projector import GaLoreProjector
 from .galore_projector_tensor import GaLoreProjectorTensor
 import torch.optim as optim
-
+from tqdm import tqdm
 
 class AdamWGradientSaving(Optimizer):
     """
@@ -47,6 +51,8 @@ class AdamWGradientSaving(Optimizer):
             no_deprecation_warning: bool = False,
             gap=100,
             name=None,
+            log_folder=None,
+            save_every_N_steps=None,
     ):
         if not no_deprecation_warning:
             warnings.warn(
@@ -75,6 +81,8 @@ class AdamWGradientSaving(Optimizer):
         self.moment_dict = {}
         self.name = name
         self.moment_second_dict = {}
+        self.log_folder = log_folder
+        self.save_every_N_steps = save_every_N_steps
 
     @torch.no_grad()
     def step(self, closure: Callable = None):
@@ -91,16 +99,15 @@ class AdamWGradientSaving(Optimizer):
         # for gradient spike detection
         # self.current_step+=1
         self.total_step += 1
-        n = 0
+        layer_n = 0
 
         for group in self.param_groups:
-            for p in group["params"]:
+            for p_name, p in zip(group["names"], group["params"]):
                 if p.grad is None:
                     continue
                 grad = p.grad
                 if grad.is_sparse:
                     raise RuntimeError("Adam does not support sparse gradients, please consider SparseAdam instead")
-
                 state = self.state[p]
 
                 if "step" not in state:
@@ -118,8 +125,6 @@ class AdamWGradientSaving(Optimizer):
                 exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
                 beta1, beta2 = group["betas"]
 
-                state["step"] += 1
-
                 # Decay the first and second moment running average coefficient
                 # In-place operations to update the averages at the same time
                 exp_avg.mul_(beta1).add_(grad, alpha=(1.0 - beta1))
@@ -129,25 +134,50 @@ class AdamWGradientSaving(Optimizer):
                 # INI - TIANJING CODE
                 # # for gradient spike detection
                 # # if 'rank' in group:
-                # if n == 20:
-                #     if n not in self.grad_dict.keys():
-                #         print("save n", n)
-                #         self.grad_dict[n] = []
-                #         self.moment_dict[n] = []
-                #         self.moment_second_dict[n] = []
-                #     self.grad_dict[n].append(grad.detach().cpu())
-                # # self.moment_dict[n].append(exp_avg.detach().cpu())
-                # # self.moment_second_dict[n].append(exp_avg_sq.detach().cpu())
-                # n += 1
+                # if layer_n == 20:
+                #     if layer_n not in self.grad_dict.keys():
+                #         print("save n", layer_n)
+                #         self.grad_dict[layer_n] = []
+                #         self.moment_dict[layer_n] = []
+                #         self.moment_second_dict[layer_n] = []
+                #     self.grad_dict[layer_n].append(grad.detach().cpu())
+                # # self.moment_dict[layer_n].append(exp_avg.detach().cpu())
+                # # self.moment_second_dict[layer_n].append(exp_avg_sq.detach().cpu())
+                # layer_n += 1
                 # END - TIANJING CODE
 
-                # for gradient spike detection
-                p_name = group["name"]
-                if p_name not in self.grad_dict.keys():
-                    print(f"Save gradients for layer:\t{p_name}")
-                    self.grad_dict[p_name] = []
-                self.grad_dict[p_name].append(grad.detach().cpu().to(dtype=torch.float16))
+                # # for gradient spike detection (only one layer)
+                # if layer_n == 20:
+                #     if layer_n not in self.grad_dict.keys():
+                #         p_name = group["name"]
+                #         print(f"Save gradients for layer:\t{layer_n} ({p_name})")
+                #         self.grad_dict[layer_n] = []
+                #     self.grad_dict[layer_n].append(grad.detach().cpu().to(dtype=torch.float16))
+                # n += 1
 
+                # # for gradient spike detection - ALL LAYERS of type: embed, layernorm
+                # p_name = group["name"]
+                # if 'embed' in p_name or 'layernorm' in p_name:
+                #     if layer_n not in self.grad_dict.keys():
+                #         print(f"Save gradients for layer:\t{layer_n} ({p_name})")
+                #         self.grad_dict[layer_n] = []
+                #     self.grad_dict[layer_n].append(grad.detach().cpu().to(dtype=torch.float16))
+                # layer_n += 1
+
+                # for gradient spike detection - ALL LAYERS
+                # p_name = group["name"]
+                if p_name not in self.grad_dict.keys():
+                    if state["step"] == 0:
+                        optim_name = self.__class__.__name__
+                        print(f"[{optim_name}] Save gradients for layer:\t{p_name}\t{grad.shape}")
+                    # self.grad_dict[layer_n] = []
+                    self.grad_dict[p_name] = np.zeros((self.save_every_N_steps, *grad.shape), dtype=np.float16)
+                # self.grad_dict[layer_n].append(grad.detach().cpu().to(dtype=torch.float16))
+                gradient_step = state["step"] % self.save_every_N_steps
+                self.grad_dict[p_name][gradient_step] = grad.detach().cpu().float().numpy()
+                layer_n += 1
+
+                state["step"] += 1
                 step_size = group["lr"]
                 if group["correct_bias"]:  # No bias correction for Bert
                     bias_correction1 = 1.0 - beta1 ** state["step"]
@@ -176,15 +206,53 @@ class AdamWGradientSaving(Optimizer):
                 if group["weight_decay"] > 0.0:
                     p.add_(p, alpha=(-group["lr"] * group["weight_decay"]))
 
-        # for gradient spike detection
-        if state['step'] % 1000 == 0 and state['step'] < 1005:
-        # if state['step'] % 10 == 0 and state['step'] < 11:
-            # np.save("./grad_id.npy",self.trajectories_id)
-            grad_dict = {str(key): torch.stack(value).float().numpy().astype(np.float16)
-                         for key, value in self.grad_dict.items()}
-            # moment_dict = {str(key): torch.stack(value).float().numpy() for key, value in self.moment_dict.items()}
-            # moment_second_dict = {str(key): torch.stack(value).float().numpy() for key, value in self.moment_second_dict.items()}
-            print("Saving gradients, don't stop the execution...")
-            np.savez_compressed("./" + self.name + "_grad_dict.npz", **grad_dict)
-            print("Saved at", "./" + self.name + "_grad_dict.npz")
+        # for gradient saving
+        if state['step'] % self.save_every_N_steps == 0 and 0 < state['step'] <= 1000:
+
+            optim_name = self.__class__.__name__
+            gradient_path = os.path.join(self.log_folder, f"{self.name}_{optim_name}_grads.h5")
+
+            # Open or create an HDF5 file
+            with h5py.File(gradient_path, 'a') as f:  # 'a' mode allows appending data
+                pbar = tqdm(self.grad_dict.keys(), desc='Saving gradients')
+                for layer_name in pbar:
+                    layer_shape = self.grad_dict[layer_name].shape
+                    layer_size = sys.getsizeof(self.grad_dict[layer_name]) / 1024 ** 2
+                    pbar.set_description(f"Saving gradients for {layer_name} ({layer_size:.2f} MB)")
+                    # Create a dataset to store the gradients of each layer
+                    if layer_name not in f:
+                        # f.create_dataset(layer_name, data=gradient, compression="gzip", chunks=True)
+                        dset = f.create_dataset(
+                            layer_name,
+                            shape=(0, *layer_shape[-2:]),  # Initial shape
+                            maxshape=(None, *layer_shape[-2:]),  # Allow expansion along axis 0
+                            dtype='float16',
+                            compression="gzip"  # Optional compression
+                        )
+                    else:
+                        dset = f[layer_name]
+
+                    # Resize the dataset to accommodate new data
+                    current_size = dset.shape[0]
+                    new_size = current_size + layer_shape[0]
+                    dset.resize(new_size, axis=0)
+
+                    # Write new data at the end of the dataset
+                    dset[current_size:new_size] = self.grad_dict[layer_name]
+
+            print("Saved at", gradient_path)
+            self.grad_dict = {}
+
+        # # for gradient spike detection - OLD CODE
+        # if state['step'] % self.save_every_N_steps == 0 and state['step'] < 1005:
+        #     # if state['step'] % 10 == 0 and state['step'] < 11:
+        #     # np.save("./grad_id.npy",self.trajectories_id)
+        #     grad_dict = {str(key): torch.stack(value).float().numpy().astype(np.float16)
+        #                  for key, value in self.grad_dict.items()}
+        #     # moment_dict = {str(key): torch.stack(value).float().numpy() for key, value in self.moment_dict.items()}
+        #     # moment_second_dict = {str(key): torch.stack(value).float().numpy() for key, value in self.moment_second_dict.items()}
+        #     print("Saving gradients, don't stop the execution...")
+        #     gradient_path = os.path.join(self.log_folder, f"{self.name}_grad_dict_{state['step']}.npz")
+        #     np.savez_compressed(gradient_path, **grad_dict)
+        #     print("Saved at", gradient_path)
         return loss

@@ -4,3 +4,6 @@ __pycache__
 wandb.key
 *.npy
 *.npz
+*.pyc
+_good_bumps_example
+logs
