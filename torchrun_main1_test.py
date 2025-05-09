@@ -28,14 +28,32 @@ from peft_pretraining.modeling_llama_test import LlamaForCausalLM
 
 from peft_pretraining.modeling_pythia import GPTNeoXForCausalLM
 import bitsandbytes as bnb
-from galore_torch import GaLoreAdafactor, AdamWGradientSaving, AdamWGradientInjection, Muon, MuonGradientSaving #AdamGradientSaving   # GaLoreAdamW0, GaLoreAdamW8bit
+from galore_torch import (GaLoreAdafactor, AdamWGradientSaving, AdamWGradientInjection,
+                          Muon, MuonGradientSaving,
+                          MuonGradientInjection)  # AdamGradientSaving   # GaLoreAdamW0, GaLoreAdamW8bit
+
 # wandb.login(key=open('wandb.key').readline())
 transformers.logging.set_verbosity_error()
 
-STEPS_STOP = 151
+
+# make deterministic
+
+# STEPS_STOP = 151
+
+
+def int_or_float(value):
+    try:
+        return int(value)
+    except ValueError:
+        try:
+            return float(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{value!r} is not an int or float")
+
 
 def parse_args(args):
     parser = argparse.ArgumentParser()
+    parser.add_argument("--exp_name", type=str, default="")
     parser.add_argument("--model_config", type=str, required=True)
     parser.add_argument("--use_hf_model", default=False, action="store_true")
     parser.add_argument("--continue_from", type=str, default=None)
@@ -69,7 +87,7 @@ def parse_args(args):
     parser.add_argument("--dtype", type=str, default="bfloat16" if torch.cuda.is_bf16_supported() else "float32")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--name", type=str, default="test")
+    # parser.add_argument("--name", type=str, default="test")
     parser.add_argument("--grad_clipping", type=float, default=0.0)
     # beta1 for adafactor
     parser.add_argument("--beta1", type=float, default=0.0)
@@ -81,23 +99,42 @@ def parse_args(args):
     parser.add_argument("--galore_scale", type=float, default=1.0)
     parser.add_argument("--proj_type", type=str, default="std")
     parser.add_argument("--data_type", type=str, default="filter")
-    parser.add_argument("--trick", type=str, default="None1")  # ln, scale
+    parser.add_argument("--trick", type=str, default="none")  # ln, scale
 
     parser.add_argument("--updating_mask_method", type=str, default="random")
     # disable ddp, single_gpu
     parser.add_argument("--single_gpu", default=False, action="store_true")
 
     # for gradient injection
-    parser.add_argument("--grad_injection_step", type=int, nargs="+", default=200)
-    parser.add_argument("--grad_injection_multiplier", type=int, nargs="+", default=5000)
-    parser.add_argument("--grad_injection_elements", type=int, nargs="+", default=100)
-    parser.add_argument("--grad_injection_layer_number", type=int, nargs="+", default=20)
+    parser.add_argument("--grad_injection_step", type=int, nargs="+", default=-1)  # default=200)
+    parser.add_argument("--grad_injection_factor", type=int_or_float, nargs="+", default=-1)  # default=5000)
+    parser.add_argument("--grad_injection_elements", type=int_or_float, nargs="+", default=-1)  # default=100)
+    parser.add_argument("--grad_injection_layer_number", type=int, nargs="+", default=-1)  # default=20)
     parser.add_argument("--grad_injection_fn", type=str, default="gaussian")
-    parser.add_argument("--grad_injection_duration", type=int, nargs="+", default=10)
+    parser.add_argument("--grad_injection_duration", type=int, nargs="+", default=-1)  # default=10)
+
+    parser.add_argument("--grad_save_layers", type=int, nargs="+", default=-1)
+
+    # grad norm scaling parameters
+    parser.add_argument("--grad_norm_scaling", default=False, action="store_true")
+    parser.add_argument("--grad_norm_scaling_gamma1", type=float, default=0.85)
+    parser.add_argument("--grad_norm_scaling_gamma2", type=float, default=0.99999)
+    parser.add_argument("--grad_norm_scaling_eta_min", type=float, default=0.5)
+    parser.add_argument("--grad_norm_scaling_scale", type=str, default=None)
+
+    # grad clipping parameters
+    parser.add_argument("--grad_ada_clipping", default=False, action="store_true")
+    parser.add_argument("--grad_ada_clipping_theta", type=float, default=0.999)
+
+    # grad centering parameters
+    parser.add_argument("--grad_centering", default=False, action="store_true")
+
+    parser.add_argument("--finish_execution_at", type=int, default=151)
 
     args = parser.parse_args(args)
     args = args_utils.check_args_torchrun_main(args)
     return args
+
 
 @torch.no_grad()
 def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, device, batch_size):
@@ -146,10 +183,18 @@ def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, 
 
 
 def main(args):
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    # for reproducibility
     random.seed(args.seed)
-    name = ""
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)  # for multi-GPU
+    # Make CUDA operations deterministic
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(args.seed)
+
+    name = args.exp_name
     assert "LOCAL_RANK" in os.environ, "torchrun should set LOCAL_RANK"
     global_rank = int(os.environ['RANK'])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -196,7 +241,7 @@ def main(args):
         raise NotImplementedError(f"data_type={args.data_type} is not implemented")
 
     seed_for_shuffle = 42
-    name = name + args.data_type + "_" + args.model_config.split("/")[-1].split(".")[0] + "_" + args.trick
+    name = name + "_" + args.data_type + "_" + args.model_config.split("/")[-1].split(".")[0] + "_" + args.trick
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_folder = os.path.join('logs', name, timestamp)
     os.makedirs(log_folder, exist_ok=True)
@@ -223,7 +268,34 @@ def main(args):
         return batch
 
     dataset = PreprocessedIterableDataset(data, tokenizer, batch_size=args.batch_size, max_length=args.max_length)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=args.workers)
+    # dataloader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=args.workers)
+
+    # for reproducibility
+    def seed_worker(worker_id):
+        """
+        Worker initialization function to ensure reproducibility with multiple workers.
+        Each worker needs to have a different but deterministic seed.
+
+        Args:
+            worker_id (int): The ID of the worker process (0 to num_workers-1)
+        """
+        # Get the base seed from the DataLoader
+        base_seed = torch.initial_seed()
+
+        # Calculate a unique seed for this worker
+        # Combine base_seed and worker_id to ensure uniqueness
+        worker_seed = (base_seed + worker_id) % 2 ** 32
+
+        # Set seeds for different random number generators
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+
+    # Create a generator that will be used to initialize the workers
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=args.workers,
+                                             worker_init_fn=seed_worker, generator=g, pin_memory=True)
 
     model_config = AutoConfig.from_pretrained(args.model_config)
     model_config.trick = args.trick
@@ -285,7 +357,10 @@ def main(args):
 
     n_total_params = sum(p.numel() for p in model.parameters())
     # trainable_params = [p for p in model.parameters() if p.requires_grad]
-    trainable_params = [{"params": p, "name": name} for name, p in model.named_parameters() if p.requires_grad]
+    trainable_params = [{"params": p,
+                         "names": [name],
+                         "ids": [i]
+                         } for i, (name, p) in enumerate(model.named_parameters()) if p.requires_grad]
     # Initialize wandb
     run_config = dict(vars(args))
     run_config.update({
@@ -339,18 +414,20 @@ def main(args):
     elif args.optimizer.lower() == "adamwgradientsaving":
         # redefine way to call galore_adamw
         optimizer = AdamWGradientSaving(trainable_params, lr=args.lr, weight_decay=args.weight_decay, gap=args.gap,
-                                        name=name, log_folder=log_folder)
+                                        name=name, log_folder=log_folder, save_every_N_steps=args.save_gradients_every)
     elif args.optimizer.lower() == "adamwgradientinjection":
         # redefine way to call galore_adamw
         optimizer = AdamWGradientInjection(trainable_params, lr=args.lr, weight_decay=args.weight_decay, gap=args.gap,
                                            name=name, log_folder=log_folder,
+                                           save_every_N_steps=args.save_gradients_every,
                                            grad_injection_step=args.grad_injection_step,
-                                           grad_injection_multiplier=args.grad_injection_multiplier,
+                                           grad_injection_factor=args.grad_injection_factor,
                                            grad_injection_elements=args.grad_injection_elements,
                                            grad_injection_layer_number=args.grad_injection_layer_number,
                                            grad_injection_fn=args.grad_injection_fn,
                                            grad_injection_duration=args.grad_injection_duration,
-                                           total_steps=args.num_training_steps)
+                                           total_steps=args.num_training_steps,
+                                           grad_save_layers=args.grad_save_layers)
     # implement muon
     elif args.optimizer.lower() == "muongradientsaving":
         # collect the parameters to optimize
@@ -361,10 +438,16 @@ def main(args):
         head_params = [model.lm_head.weight]
 
         hidden_matrix_names = [n for n, p in model.named_parameters()
-                                if p.ndim >= 2 and "embed" not in n and "lm_head" not in n]
+                               if p.ndim >= 2 and "embed" not in n and "lm_head" not in n]
         embed_names = [n for n, p in model.named_parameters() if "embed" in n]
         scalar_names = [n for n, p in model.named_parameters() if p.ndim < 2]
-        head_names = ["model.lm_head.weight"]
+        head_names = [n for n, p in model.named_parameters() if "lm_head" in n]
+
+        hidden_matrix_ids = [i for i, (n, p) in enumerate(model.named_parameters())
+                             if p.ndim >= 2 and "embed" not in n and "lm_head" not in n]
+        embed_ids = [i for i, (n, p) in enumerate(model.named_parameters()) if "embed" in n]
+        scalar_ids = [i for i, (n, p) in enumerate(model.named_parameters()) if p.ndim < 2]
+        head_ids = [i for i, (n, p) in enumerate(model.named_parameters()) if "lm_head" in n]
 
         # log parameters being optimized by Muon
         muon_params_table = wandb.Table(columns=["param_name", "param_shape"])
@@ -374,10 +457,10 @@ def main(args):
         wandb.log({"muon_params": muon_params_table})
 
         # init the optimizer(s)
-        adam_params = [dict(names=head_names, params=head_params, lr=args.lr_adam_head),
-                       dict(names=embed_names, params=embed_params, lr=args.lr_adam_embed),
-                       dict(names=scalar_names, params=scalar_params, lr=args.lr_adam_scalar)]
-        muon_params = dict(names=hidden_matrix_names, params=hidden_matrix_params)
+        adam_params = [dict(ids=head_ids, names=head_names, params=head_params, lr=args.lr_adam_head),
+                       dict(ids=embed_ids, names=embed_names, params=embed_params, lr=args.lr_adam_embed),
+                       dict(ids=scalar_ids, names=scalar_names, params=scalar_params, lr=args.lr_adam_scalar)]
+        muon_params = dict(ids=hidden_matrix_ids, names=hidden_matrix_names, params=hidden_matrix_params)
         # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
         # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
         # optimizer1 = torch.optim.Adam(adam_params, weight_decay=args.weight_decay,
@@ -392,6 +475,79 @@ def main(args):
         # optimizer2 = Muon(hidden_matrix_params, lr=args.lr_muon, momentum=0, nesterov=False, rank=local_rank, world_size=world_size)
         # logger.info("Working with STATELESS Muon")
         optimizers = [optimizer1, optimizer2]
+
+    elif args.optimizer.lower() == "muongradientinjection":
+        # collect the parameters to optimize
+        hidden_matrix_params = [p for n, p in model.named_parameters()
+                                if p.ndim >= 2 and "embed" not in n and "lm_head" not in n]
+        embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+        scalar_params = [p for n, p in model.named_parameters() if p.ndim < 2]
+        head_params = [model.lm_head.weight]
+
+        hidden_matrix_names = [n for n, p in model.named_parameters()
+                               if p.ndim >= 2 and "embed" not in n and "lm_head" not in n]
+        embed_names = [n for n, p in model.named_parameters() if "embed" in n]
+        scalar_names = [n for n, p in model.named_parameters() if p.ndim < 2]
+        head_names = [n for n, p in model.named_parameters() if "lm_head" in n]
+
+        hidden_matrix_ids = [i for i, (n, p) in enumerate(model.named_parameters())
+                             if p.ndim >= 2 and "embed" not in n and "lm_head" not in n]
+        embed_ids = [i for i, (n, p) in enumerate(model.named_parameters()) if "embed" in n]
+        scalar_ids = [i for i, (n, p) in enumerate(model.named_parameters()) if p.ndim < 2]
+        head_ids = [i for i, (n, p) in enumerate(model.named_parameters()) if "lm_head" in n]
+
+        # log parameters being optimized by Muon
+        muon_params_table = wandb.Table(columns=["param_name", "param_shape"])
+        for param_name, param_weight in model.named_parameters():
+            if param_weight.ndim >= 2 and "embed" not in param_name:
+                muon_params_table.add_data(param_name, str(param_weight.shape))
+        wandb.log({"muon_params": muon_params_table})
+
+        # init the optimizer(s)
+        adam_params = [dict(ids=head_ids, names=head_names, params=head_params, lr=args.lr_adam_head),
+                       dict(ids=embed_ids, names=embed_names, params=embed_params, lr=args.lr_adam_embed),
+                       dict(ids=scalar_ids, names=scalar_names, params=scalar_params, lr=args.lr_adam_scalar)]
+        muon_params = dict(ids=hidden_matrix_ids, names=hidden_matrix_names, params=hidden_matrix_params)
+        # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
+        # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
+        # optimizer1 = torch.optim.Adam(adam_params, weight_decay=args.weight_decay,
+        #                               betas=(0.8, 0.95), eps=1e-10, fused=True)
+        optimizer1 = AdamWGradientInjection(adam_params, weight_decay=args.weight_decay, betas=(0.8, 0.95), eps=1e-10,
+                                            gap=args.gap, name=name,
+                                            log_folder=log_folder, save_every_N_steps=args.save_gradients_every,
+                                            grad_injection_step=args.grad_injection_step,
+                                            grad_injection_factor=args.grad_injection_factor,
+                                            grad_injection_elements=args.grad_injection_elements,
+                                            grad_injection_layer_number=args.grad_injection_layer_number,
+                                            grad_injection_fn=args.grad_injection_fn,
+                                            grad_injection_duration=args.grad_injection_duration,
+                                            total_steps=args.num_training_steps,
+                                            grad_save_layers=args.grad_save_layers)
+        optimizer2 = MuonGradientInjection(muon_params, lr=args.lr_muon, momentum=0.95,
+                                           rank=local_rank, world_size=world_size,
+                                           name=name,
+                                           log_folder=log_folder, save_every_N_steps=args.save_gradients_every,
+                                           grad_injection_step=args.grad_injection_step,
+                                           grad_injection_factor=args.grad_injection_factor,
+                                           grad_injection_elements=args.grad_injection_elements,
+                                           grad_injection_layer_number=args.grad_injection_layer_number,
+                                           grad_injection_fn=args.grad_injection_fn,
+                                           grad_injection_duration=args.grad_injection_duration,
+                                           total_steps=args.num_training_steps,
+                                           grad_save_layers=args.grad_save_layers,
+                                           grad_norm_scaling=args.grad_norm_scaling,
+                                           grad_norm_scaling_gammas=(args.grad_norm_scaling_gamma1,
+                                                                     args.grad_norm_scaling_gamma2),
+                                           grad_norm_scalin_total_T=args.num_training_steps,
+                                           grad_norm_scaling_eta_min=args.grad_norm_scaling_eta_min,
+                                           grad_norm_scaling_scale=args.grad_norm_scaling_scale,
+                                           grad_ada_clipping=args.grad_ada_clipping,
+                                           grad_ada_clipping_theta=args.grad_ada_clipping_theta,
+                                           grad_centering=args.grad_centering)
+        # optimizer2 = Muon(hidden_matrix_params, lr=args.lr_muon, momentum=0, nesterov=False, rank=local_rank, world_size=world_size)
+        # logger.info("Working with STATELESS Muon")
+        optimizers = [optimizer1, optimizer2]
+
     # implement sgd
     elif args.optimizer.lower() == "sgd":
         optimizer = torch.optim.SGD(trainable_params, lr=args.lr, weight_decay=args.weight_decay, momentum=args.beta1)
@@ -522,6 +678,15 @@ def main(args):
             print(f"Rank {global_rank} stopping training.")
             break
 
+        if update_step > args.finish_execution_at:
+            print(f"Reached {args.finish_execution_at} steps, stopping training...")
+            # Ensure cleanup happens even if an exception occurs
+            if dist.is_initialized():
+                dist.destroy_process_group()
+                print("dist properly finished")
+            return 0
+        # The below code is only executed during the update step
+
         batch = {k: v.to(device) for k, v in batch.items()}
         labels = batch["input_ids"].clone()
         labels[labels == pad_idx] = -100
@@ -542,12 +707,6 @@ def main(args):
             if global_rank == 0:
                 np.save(os.path.join(log_folder, name + "_loss"), np.array(losses))
                 print(f"Saving loss to: {log_folder}")
-        # if update_step > 750:
-
-        if update_step > STEPS_STOP:
-            print(f"Reached {STEPS_STOP} steps, stopping training...")
-            return 0
-        # The below code is only executed during the update step
 
         # add grad clipping
         if args.grad_clipping != 0.0: torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
